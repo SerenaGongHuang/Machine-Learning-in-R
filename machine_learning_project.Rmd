@@ -1,0 +1,498 @@
+---
+title: "Machine Learning in R"
+author: "Serena Huang"
+output:
+  pdf_document: default
+  html_document: default
+---
+## Executive Summary
+Our analysis identifies key factors influencing call conversion likelihood. By leveraging predictive analytics and averaging the conversion likelihood from logistic regression and random forest models, we identified key trends. Specifically, individuals aged 60-69, households earning between 100K-200K annually, and smaller households (size 2) demonstrate the highest likelihood of conversion. In contrast, we found that call attributes had a mixed impact on conversion likelihood compared to caller characteristics.
+
+## Overview
+The objective of this project is to estimate the conversion likelihood for each call in the dataset and identify the call types most likely to convert. To accomplish this, we will conduct exploratory data analysis and preprocess the data accordingly. Subsequently, we will develop and train various machine learning classification models, including logistic regression, decision trees, and random forests. We will then evaluate these models based on metrics such as confusion matrix, ROC curve, and AUC to select the most effective model. Additionally, we will visualize our findings using multiple box plots to illustrate the relationship between conversion likelihood and call and caller attributes.
+
+## Data Setup 
+```{r, message=FALSE}
+# Set up libraries and working directory
+rm(list=ls()) 
+library(tidyverse)
+library(caret)
+library(ggpubr)
+library(ggplot2)
+library(fastDummies)
+library(glmnet)
+library(randomForest)
+library(pROC)
+library(ROCR)
+library(tree)
+library(rpart)
+library(rpart.plot)
+setwd("C:/Users/seren/OneDrive/Desktop/Machine_Learning")
+
+# Read in datasets
+health_calls_2023 <- read.csv("health_calls_2023.csv")
+health_calls_2024 <- read.csv("health_calls_2024.csv")
+source_data <- read.csv("source.csv")
+user_data <- read.csv("user_provided_data.csv")
+
+# Merge datasets
+calls <- health_calls_2023 %>%
+  mutate(season="Q4_2023") %>%
+  bind_rows(health_calls_2024) %>%
+  mutate(season = ifelse(is.na(season), "Q1_2024", season)) %>%
+  left_join(source_data, by = "source_id") %>%
+  left_join(user_data, by = "call_id")
+```
+
+## Data Exploration
+After taking a quick look at the summary data, we can see the quantile percentages for each variable. Besides this, we also notice a lot of missing data, which will be addressed in the 'Data Processing' section. 
+```{r, warning=FALSE}
+# Simple summary of dataset
+summary(calls)
+```
+
+Despite the presence of 85,927 missing values out of 99,546 total records for the conversion variable, our exploratory data analysis focuses on the remaining 13,619 rows where conversion data is available. We aim to explore how conversion is distributed within this subset and its variations across different features.
+
+We will draw stacked bar plots for categorical features and box plots for numeric features. 
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, fig.width=7, fig.height=4}
+calls$conversion <- as.factor(calls$conversion)
+
+# Get a dataset where conversion is not NA for data visualization
+calls_viz <- calls %>% 
+  filter(!is.na(conversion)) 
+
+# Visualize the conversion variable   
+calls_viz %>% 
+  group_by(conversion) %>% 
+  summarise(count = n()) %>% 
+  mutate(percent = prop.table(count)*100) %>% 
+  ggplot(aes(reorder(conversion, -percent), percent), fill=conversion) +
+  geom_col(fill=c("coral1", "darkturquoise")) +
+  geom_text(aes(label = sprintf("%.2f%%", percent)), hjust = 0.3,vjust = -0.5, size =3) +
+  labs(x="conversion", title="Conversion Percent")
+```
+
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, fig.width=7, fig.height=8}
+# Change a few variables to character to convert it to factor later on
+user_data$currently_insured <- as.character(user_data$currently_insured)
+
+# Get numeric and categorical column names 
+numeric_columns <- names(user_data)[sapply(user_data, is.numeric)]
+categorical_columns <- names(user_data)[sapply(user_data, is.character)]
+categorical_columns <- categorical_columns[-c(1)]
+other_categorical_columns <- c("season")
+categorical_columns <- union(categorical_columns, other_categorical_columns)
+# print(paste0("These are numeric columns: ", numeric_columns))
+# print(paste0("These are categorical columns: ", categorical_columns))
+
+
+# Creating a list to store plots
+categorical_plots_list <- list()
+numeric_plots_list <- list()
+
+# Creating plots with do loop 
+for (x_col in categorical_columns) {
+  # Create ggplot for current x_col
+  p <- ggplot(calls_viz, aes_string(x = x_col, fill = "conversion")) +
+    geom_bar(position = "fill") +   
+    labs(title = paste("Conversion by", x_col),
+       x = x_col,
+       y = "Conversion percentage") +
+    theme(axis.text.x = element_text(size = 7, angle=25))
+  
+  # Add plot to the list
+  categorical_plots_list[[x_col]] <- p
+}
+
+for (x_col in numeric_columns) {
+  # Create ggplot for current x_col
+  p <- ggplot(calls_viz, aes_string(x = "conversion", y = x_col)) +
+    geom_boxplot() +   
+    labs(title = paste("Conversion by", x_col),
+       x = "Conversion status",
+       y = x_col) +
+    theme_minimal()
+  
+  # Add plot to the list
+  numeric_plots_list[[x_col]] <- p
+}
+
+ggarrange(plotlist = categorical_plots_list, ncol = 1, nrow = 4) 
+ggarrange(plotlist = numeric_plots_list, ncol = 2, nrow = 3)  
+
+# State table
+calls_viz %>%
+  group_by(state) %>%
+  summarize(convert_pct=100*sum(conversion==1)/n(),
+            no_convert_pct=100*sum(conversion==0)/n()) 
+```
+
+**Findings:**
+
+1) The dataset contains a significantly larger number of non-converted callers compared to converted callers.
+
+2) Conversion rates do indeed vary across different features. For instance, the browser analysis reveals that Firefox exhibits a higher conversion rate compared to other browsers.
+
+3) Outliers are observed in columns such as household_income, suggesting potential anomalies in the data.
+
+These findings highlight the need for careful data preparation and modeling, which will be done in the following sections.
+
+## Data Processing
+As we mentioned above, there are a few issues with the data. 
+
+
+**Missing Data**
+
+Variables with missing values can be categorized into four groups, to address these issues, we have a solution for each category.
+
+1) Variables with constant/missing values throughout the entire dataset (e.g., credit_rating, married, seller_type)
+
+    *Solution:* Drop these columns as they do not provide any additional information
+
+2) Variables with more than 85% missing data (e.g., currently_insured, BMI, height, weight). 
+
+    *Solution:* Drop all these columns in the training and testing data
+
+3) Variables with less than 1% missing data (e.g., age, household_income)
+
+    *Solution:* Replace these missing values with the mean
+
+4) Variables with blanks instead of NAs (e.g., browser, browser_platform, coverage_type, company, gender, subsidy) 
+
+    *Solution:* Replace them with NAs
+
+
+Without addressing these, models may fail to converge, produce biased predictions, or lead to unstable results. 
+
+
+**Outliers**
+
+Variables such as bmi, weight, height, household_income have outlier variables. We use the IQR method to  establish lower and upper bounds to cap extreme values in bmi, weight, height. We then use log transformation to mitigate skewness in household income data. Last but no least, we standardize all numeric variable to ensure they are on the same scale.These practices will help mitigate bias in results and facilitate meaningful comparisons between variables
+
+**Categorical Variables**
+
+We use the one hot encoding method to transform categorical variables into dummies. This ensures that all categories are appropriately represented and considered during model training and prediction.
+
+**Model Imbalance**
+
+Given the higher number of non-converted callers compared to converted callers, we use the upsampling method to increase the representation of converted callers in the training dataset. This means randomly duplicating instances of converted callers. We do this because it aims to create a more balanced and representative training dataset, leading to better model performance and generalization.
+
+After we address these issues, we will split the dataset into training (80%) and testing (20%) data. 
+```{r, warning=FALSE}
+calls_data <- calls 
+
+# Convert blanks to NA for all columns
+# Adding this here so that it doesn't affect the creation of dummy vars
+calls <- calls %>%
+  mutate_all(~ ifelse(. == "", NA, .))
+
+# Imputation
+calls_data$age <- 
+  ifelse(is.na(calls_data$age), mean(calls_data$age, na.rm = TRUE), calls_data$age)
+calls_data$household_income <- 
+  ifelse(is.na(calls_data$household_income), 
+         mean(calls_data$household_income, na.rm = TRUE), calls_data$household_income)
+
+# One hot encoding 
+calls_all <- dummy_cols(calls_data, select_columns = categorical_columns, remove_first_dummy = TRUE)
+calls_data <- calls_all[, !(names(calls_all) %in% categorical_columns)]
+
+calls_data <- calls_data %>%
+  select(-c("call_id", "phone_num_hash","buyer_id","source_id","time",
+            "call_duration","seller_id","credit_rating","married","seller_type"))
+
+# Log
+calls_data$household_income <- log(calls_data$household_income + 1)
+
+# Handling outliers
+handle_outliers <- function(column) {
+  Q1 <- quantile(column, 0.25, na.rm = TRUE)
+  Q3 <- quantile(column, 0.75, na.rm = TRUE)
+  IQR <- Q3 - Q1
+  lower_bound <- Q1 - 1.5 * IQR
+  upper_bound <- Q3 + 1.5 * IQR
+  column[column < lower_bound] <- lower_bound
+  column[column > upper_bound] <- upper_bound
+  return(column)
+}
+
+calls_data$weight <- handle_outliers(calls_data$weight)
+calls_data$height <- handle_outliers(calls_data$height)
+calls_data$bmi <- handle_outliers(calls_data$bmi)
+
+# Standardizing columns 
+calls_data[numeric_columns] <- scale(calls_data[numeric_columns])
+```
+
+
+```{r, warning=FALSE}
+set.seed(1999)
+  
+# Get a dataset where conversion is not NA
+calls_train_data <- calls_data %>% 
+  filter(!is.na(conversion)) 
+
+# Get rid of missing values
+calls_train_data <- calls_train_data %>%
+  select(-c("currently_insured_1","currently_insured_NA","weight","bmi","height"))
+
+train_index <- createDataPartition(calls_train_data$conversion, p = 0.8, list = FALSE)
+train <- calls_train_data[train_index, ]
+test <- calls_train_data[-train_index, ]
+
+# Upsample
+train <- upSample(
+  x=train[,-1],
+  y=train[,1]
+)
+
+train <- train %>%
+  rename(conversion=Class)
+```
+
+## Model Building
+We implemented three machine learning classification models, logistic regression, classification trees, and random forests, to predict the conversion likelihood. We then use the confusion matrix to quantify classification accuracy, and ROC curve and AUC to visualize and quantify the model's discriminatory power.
+
+### Logistic Regression
+
+We implement logistic regression because it's well-suited for predicting binary outcomes. This method provides probabilities of conversion based on various predictor variables and also allows for the interpretation of coefficients, helping to understand how each predictor contributes to the likelihood of conversion. Its simplicity and interpretability make it a suitable choice for this predictive modeling task.
+```{r, warning=FALSE}
+# Logistic regression
+# Fit the logistic regression model
+glm_model <- glm(conversion~., data = train, family = binomial)
+
+# Summarize the model
+summary(glm_model)
+
+# Predict probabilities on the training data
+phat_glm <- predict(glm_model,test, type = "response", probability=TRUE)
+
+# Confusion matrix
+test_cm <- factor(ifelse(test$conversion==1, "Yes","No"))
+threshold_glm<- factor(ifelse(phat_glm>=0.5, "Yes","No"))
+confusionMatrix(data=threshold_glm,reference=test_cm)
+cm_glm <- confusionMatrix(data=threshold_glm,reference=test_cm)$overall['Accuracy']
+
+# ROC
+pred_glm <- prediction(phat_glm,test$conversion)
+perf_glm <- performance(pred_glm,"tpr","fpr")
+plot(perf_glm)
+
+# AUC
+perf_glm_auc <- performance(pred_glm,measure = "auc")
+print(paste0(perf_glm_auc@y.values[[1]]))
+```
+
+**Findings:**
+
+1) The logistic regression model revealed significant associations between conversion and several variables. Age and household income were positively associated with conversion (coefficients: 0.15326, p < 0.001; 0.53072, p < 0.001, respectively). State-level variables like AR, MN, VT, and WY also showed positive effects, indicating varying impacts across states. Categorical variables such as household size and Q4 2023 season had significant associations with conversion. However, variables related to browsers and platforms showed mixed significance levels. Overall, the model demonstrated a reasonable fit.
+
+2) The confusion matrix accuracy was 0.63, indicating the model correctly predicted 63% of outcomes. The AUC of 0.67 suggests moderate capability in distinguishing between positive and negative classes. These metrics collectively indicate potential for improving the model's accuracy in predicting conversion outcomes and classifying them based on ROC curve analysis.
+
+### Classifcation Tree
+
+We implement classification trees due to their ability to handle complex predictor interactions and hierarchical decision rules. They are advantageous for their ability to handle both numerical and categorical data, their interpretability through visual representation, and are robust against outliers and non-linear relationships. This method was explored to capture non-linear relationships and interactions that logistic regression might overlook.
+```{r, warning=FALSE}
+# Classification Tree
+ct_model<- rpart(conversion ~., data=train, method="class", cp=0.003, minsplit=10, xval=10)
+printcp(ct_model)
+plotcp(ct_model)
+
+pruned_ct_model <- prune(ct_model, cp=ct_model$cptable[which.min(ct_model$cptable[,"xerror"]),"CP"])
+length(pruned_ct_model$frame$var[pruned_ct_model$frame$var=="<leaf>"])
+prp(pruned_ct_model, type=1, extra=1, split.font=1, varlen=-10)
+
+# Predict probabilities on the training data
+phat_ct <- predict(pruned_ct_model,newdata=test, type="prob")[,2]
+
+# Confusion matrix
+test_cm <- factor(ifelse(test$conversion==1, "Yes","No"))
+threshold_ct<- factor(ifelse(phat_ct>=0.5, "Yes","No"))
+confusionMatrix(data=threshold_ct,reference=test_cm)
+cm_ct <- confusionMatrix(data=threshold_ct,reference=test_cm)$overall['Accuracy']
+
+# ROC
+pred_ct <- prediction(phat_ct,test$conversion)
+perf_ct <- performance(pred_ct,"tpr","fpr")
+plot(perf_ct)
+
+# AUC
+perf_ct_auc <- performance(pred_ct,measure = "auc")
+print(paste0(perf_ct_auc@y.values[[1]]))
+```
+
+**Findings:**
+
+1) The classification tree identifies household_income as the root node, underscoring its substantial influence on predictions. Further down the tree, variables like device, browser, age, connection type, and gender are also pivotal in determining the likelihood of conversion. These results are consistent with the insights from our logistic regression model.
+
+2) The confusion matrix accuracy was 0.62, indicating the model correctly predicted 62% of outcomes. The AUC of 0.64 suggests moderate capability in distinguishing between positive and negative classes. These metrics collectively indicate potential for improving the model's accuracy in predicting conversion outcomes and classifying them based on ROC curve analysis. Both metrics did slightly worse than the logistic regression.
+
+
+### Random Forest
+
+We implement random forests as they offer several advantages over individual decision trees. Random forests are an ensemble learning method that combines multiple decision trees to improve prediction accuracy and robustness. They mitigate overfitting by averaging multiple trees trained on different subsets of the data and features, thereby reducing variance and enhancing generalizability. Random forests can handle large datasets with many predictors and are less sensitive to outliers compared to single decision trees. They are effective in capturing complex interactions and non-linear relationships among variables, making them suitable for predicting conversion outcomes based on diverse user attributes and behaviors.
+
+```{r, warning=FALSE}
+# Random Forest
+rf_model <- randomForest(conversion ~ ., data=train, ntree=100, 
+                         nodesize=10, cv=5, importance=TRUE)
+
+# Predict probabilities on the training data
+phat_rf <- predict(rf_model,newdata=test, type="prob")[,2]
+
+# Confusion matrix
+test_cm <- factor(ifelse(test$conversion==1, "Yes","No"))
+threshold_rf<- factor(ifelse(phat_rf>=0.5, "Yes","No"))
+confusionMatrix(data=threshold_rf,reference=test_cm)
+cm_rf <- confusionMatrix(data=threshold_rf,reference=test_cm)$overall['Accuracy']
+
+# ROC
+pred_rf <- prediction(phat_rf,test$conversion)
+perf_rf <- performance(pred_rf,"tpr","fpr")
+plot(perf_rf)
+
+# AUC
+perf_rf_auc <- performance(pred_rf,measure = "auc")
+print(paste0(perf_rf_auc@y.values[[1]]))
+
+# Variable importance plot
+varImpPlot(rf_model,type=1,main="")
+```
+
+**Findings:**
+
+1) The variable importance plot ranks features by their importance score, providing insight into which variables are most influential in predicting the outcome. From the plot, we can see that the most important factors are age, household income, and household size. These findings align with the results from the previous classification models, confirming the significant roles these variables play in predicting conversion. 
+
+2) The confusion matrix accuracy was 0.69, indicating the model correctly predicted 69% of outcomes. The AUC of 0.65 suggests moderate capability in distinguishing between positive and negative classes. These metrics collectively indicate potential for improving the model's accuracy in predicting conversion outcomes and classifying them based on ROC curve analysis. Both metrics did slightly better than the classification tree.
+
+## Model Evaluation
+We now combine all the results from confusion matrix, ROC and AUC to choose the best model. 
+```{r, warning=FALSE}
+# Confusion Matrix
+print(paste0("Logistic Regression Accuracy: ", cm_glm))
+print(paste0("Classification Tree Accuracy: ", cm_ct))
+print(paste0("Random Forest Accuracy: ", cm_rf))
+
+# ROC
+plot(perf_glm, col="red",lwd=2, main='ROC curve', cex.lab=1)
+plot(perf_ct, add = T, col="blue",lwd=2)
+plot(perf_rf, add = T, col="green",lwd=2)
+legend("bottomright", legend=c("Logistic Regression","Classification Tree","Random Forest"), 
+       col=c("red","blue","green"), lty=1, lwd=2)
+
+# AUC
+print(paste0("Logistic Regression AUC: ", perf_glm_auc@y.values[[1]]))
+print(paste0("Classification Tree AUC: ", perf_ct_auc@y.values[[1]]))
+print(paste0("Random Forest AUC: ", perf_rf_auc@y.values[[1]]))
+```
+
+**Findings:**
+
+1) Random forest achieves the highest confusion matrix accuracy at 69%.
+
+2) Logistic regression and random forest both outperform the classification tree in ROC analysis.
+
+3) Logistic regression has the best AUC, with an area of 0.67.
+
+4) Consequently, we will use both logistic regression and random forest models, and calculate the mean likelihood for predictions.
+
+## Predict Conversion Likelihood
+To answer the first question, we use logistic regression and random forest to calculate conversion likelihood, and then average both likelihoods to obtain the desired probability.
+
+To answer the second question, we recreate the box plots using the averaged likelihood as the y-variable and other features as the x-variables. For numeric variables, we create bins for age and household income groups, and factors for household size. Categorical variables are also converted to factors. We then draw box plots to identify which types of callers have higher conversion likelihoods.
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, fig.width=7, fig.height=8}
+# Predict conversion likelihood for all calls
+calls$conversion_likelihood_glm <- predict(glm_model, calls_data, type = "response", probability=TRUE)
+calls$conversion_likelihood_rf <- predict(rf_model, calls_data, type = 'prob')[, 2]
+
+calls$conversion_likelihood_glm <- as.numeric(calls$conversion_likelihood_glm)
+calls$conversion_likelihood_rf <- as.numeric(calls$conversion_likelihood_rf)
+
+# Get the average conversion
+calls <- calls %>%
+  mutate(conversion_likelihood_avg=(conversion_likelihood_glm+conversion_likelihood_rf)/2)
+
+# Create bins for numeric columns
+calls$age_bin <- cut(calls$age, breaks = c(18, 30, 40, 50, 60, 70, 80), 
+                    labels = c("18-29", "30-39", "40-49", "50-59", "60-69", "70-80"), 
+                    include.lowest = TRUE, right = FALSE)
+calls$household_income_bin <- 
+        cut(calls$household_income, 
+            breaks = c(0, 100000, 200000, 500000, 1000000, 2000000, 5000000, 8500000), 
+            labels = c("0-100K", "100K-200K", "200K-500K", "500K-1M", "1M-2M", "2M-5M", "5M+"),
+            include.lowest = TRUE, right = FALSE)
+
+# Box plots for numeric columns
+p_age <- ggplot(calls, aes(x = age_bin, y = conversion_likelihood_avg)) +
+  geom_boxplot() +
+  labs(title = "Conversion likelihood by age bin",
+       x = "age bin",
+       y = "conversion likelihood") +
+  theme_minimal()
+
+p_inc <- ggplot(calls, aes(x = household_income_bin, y = conversion_likelihood_avg)) +
+  geom_boxplot() +
+  labs(title = "Conversion likelihood by household income bin",
+       x = "household income bin",
+       y = "conversion likelihood") +
+  theme_minimal()
+
+calls$household_size=as.factor(calls$household_size)
+p_siz <- ggplot(calls, aes(x = household_size, y = conversion_likelihood_avg)) +
+  geom_boxplot() +
+  labs(title = "Conversion likelihood by household size",
+       x = "household size",
+       y = "conversion likelihood") +
+  theme_minimal()
+
+
+# Create factors for categorical columns
+for (col in categorical_columns) {
+  calls[[col]] <- as.factor(calls[[col]])
+}
+
+# Use do loop to plot 
+categorical_plots_list1=list()
+for (x_col in categorical_columns) {
+  # Create ggplot for current x_col
+  p1 <- ggplot(calls, aes_string(x = x_col, y = "conversion_likelihood_avg")) +
+    geom_boxplot() +
+  labs(title = paste("Conversion likelihood by", x_col),
+       x = x_col,
+       y = "Conversion likelihood") +
+  theme(axis.text.x = element_text(size = 7, angle=25))
+  
+  # Add plot to the list
+  categorical_plots_list1[[x_col]] <- p1
+}
+
+ggarrange(p_age, p_inc, p_siz, ncol = 1, nrow = 3)
+ggarrange(plotlist = categorical_plots_list1, ncol = 1, nrow = 4) 
+
+```
+
+From our previous findings, we know that age, household income and household size are the three most determining factors in predicting conversion likelihood. Other call attributes gave mixed signals throughout different machine learning models. Combined with the box plots above we can see which types of calls made by which type of callers are more likely to convert.
+
+**Findings:**
+
+1) *Age*: The likelihood of conversion shows an upward trend with increasing user age, reaching its highest point among callers aged 60-69. However, this trend reverses for callers aged 70-80, where the likelihood of conversion begins to decline. Therefore we believe callers aged 60-69 are most likely to convert. This trend may be influenced by factors such as financial stability and increased healthcare needs typical of this age group. Older adults nearing retirement age often have more disposable income and may be actively seeking new services or plans to cater to their evolving lifestyle and healthcare requirements.
+
+2) *Household income*: The likelihood of conversion peaks among callers with household incomes ranging from 100K-200K. The trend initially rises, then dips, followed by a gradual increase. Therefore, we conclude that callers within this income bracket are most likely to convert. Factors influencing this trend could include purchasing power and affordability aligned with service offerings, where households in this income range may find the value proposition compelling enough to initiate conversion. Additionally, economic stability and disposable income within this bracket might facilitate easier adoption of new plans or services.
+
+3) *Household size*: The likelihood of conversion decreases as household size increases, peaking when the household size is 2. Smaller households, like couples or individuals, may have more focused needs that align closely with conversion offerings, leading to higher likelihoods of adoption. In contrast, larger households, such as families, often face more complex decision-making dynamics, including existing commitments and diverse preferences among members, which can lower the likelihood of adopting new plans. Therefore, households of size 2 show a higher likelihood for conversion compared to larger household sizes.
+
+## Limitations
+An accuracy of 60%+ suggests room for improvement, which could be influenced by several factors:
+
+1) As the project mentioned, only one buyer (buyer_id = 63253) has conversion data in the dataset and we do not know the status of calls bought by the other buyers. This means we don't have information on whether calls bought by other buyers led to conversions or not. This imbalance in data could affect how well our models predict outcomes for different types of buyers. This could cause a bias problem especially when dealing with buyers who behave differently from the one we have conversion data on.
+
+2) There were too many missing values in crucial columns such as weight and BMI, which are typically significant indicators of health status and could influence the likelihood of converting to a health plan. Since these columns had over 85% missing data, using mean imputation wasn't feasible, so removing the columns became necessary. To improve our model's accuracy, it would be beneficial to collect more data on weight, BMI, and possibly credit rating and seller type. This additional information could provide more insights and potentially enhance the predictive capabilities of our model. 
+
+3) Time constraints significantly influenced our approach during this project. Given more time, we could have explored additional methods and machine learning models. For instance, techniques like SMOTE could have been implemented to address imbalanced data issues. Moreover, leveraging advanced algorithms such as XGBoost could have enhanced the training and prediction accuracy of our models.
+
+## Conclusion
+In conclusion, our analysis successfully predicted the likelihood of caller conversion using various machine learning models. Key features such as household income, household size, and age emerged as significant factors influencing conversion outcomes. These insights underscore the importance of demographic and socioeconomic variables in understanding user behavior. By accurately predicting conversion likelihood, businesses can target high-conversion demographics, and enhance customer acquisition strategies. This can lead to improved marketing ROI, increased sales revenue, and better overall business performance. These findings not only validate the relevance of data-driven decision-making but also highlight the potential for leveraging predictive analytics to gain a competitive edge in the market.
+
